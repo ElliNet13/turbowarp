@@ -1,15 +1,10 @@
-# Simple workflow for deploying static content to GitHub Pages
 name: Deploy static content to Pages
 
 on:
-  # Runs on pushes targeting the default branch
   push:
     branches: ["main"]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
   contents: read
   pages: write
@@ -29,11 +24,168 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install pandoc
-        run: sudo apt-get update && sudo apt-get install -y pandoc
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc jq nodejs npm
+          npm install -g esprima
 
-      - name: Generate index.html from README.md
-        run: pandoc README.md -f markdown -t html -s -o index.html
+      - name: Generate main README HTML fragment
+        run: |
+          pandoc README.md -f markdown -t html --standalone=false -o readme_fragment.html
+
+      - name: Generate HTML for all Markdown files (except README.md)
+        run: |
+          for mdfile in *.md; do
+            if [ "$mdfile" != "README.md" ]; then
+              outfile="${mdfile%.md}.html"
+              pandoc "$mdfile" -f markdown -t html -s -o "$outfile"
+            fi
+          done
+
+      - name: Generate class info HTML for JS files with one class and constructor vars
+        run: |
+          mkdir -p js_class_info
+          for jsfile in *.js; do
+            [ ! -f "$jsfile" ] && continue
+
+            class_count=$(node -e "
+              const esprima = require('esprima');
+              const fs = require('fs');
+              const src = fs.readFileSync('$jsfile', 'utf8');
+              const ast = esprima.parseModule(src, { jsx: true });
+              const classes = ast.body.filter(n => n.type === 'ClassDeclaration');
+              console.log(classes.length);
+            ")
+
+            if [ \"$class_count\" -eq 1 ]; then
+              node -e "
+                const esprima = require('esprima');
+                const fs = require('fs');
+                const src = fs.readFileSync('$jsfile', 'utf8');
+                const ast = esprima.parseModule(src, { jsx: true });
+                const cls = ast.body.find(n => n.type === 'ClassDeclaration');
+                const className = cls.id.name;
+
+                // Find constructor method
+                const constructorMethod = cls.body.body.find(m => m.type === 'MethodDefinition' && m.kind === 'constructor');
+
+                // Extract variables declared in constructor
+                let vars = [];
+                if (constructorMethod) {
+                  const constructorBody = constructorMethod.value.body.body;
+                  constructorBody.forEach(node => {
+                    if (node.type === 'VariableDeclaration') {
+                      node.declarations.forEach(decl => {
+                        let val = '';
+                        if (decl.init) {
+                          if (decl.init.type === 'Literal') {
+                            val = ' = ' + JSON.stringify(decl.init.value);
+                          } else if (decl.init.type === 'Identifier') {
+                            val = ' = ' + decl.init.name;
+                          } else {
+                            val = ' = [complex expression]';
+                          }
+                        }
+                        vars.push(decl.id.name + val);
+                      });
+                    }
+                  });
+                }
+
+                // Escape HTML helper
+                function escapeHtml(text) {
+                  return text.replace(/[&<>\\"']/g, function(m) {
+                    return {'&':'&amp;', '<':'&lt;', '>':'&gt;', '\"':'&quot;', \"'\":'&#39;'}[m];
+                  });
+                }
+
+                const rawSrc = escapeHtml(src);
+
+                const html = \`
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='UTF-8' />
+<meta name='viewport' content='width=device-width, initial-scale=1' />
+<title>\${className} - Class Info</title>
+<style>
+  body { font-family: monospace, monospace; margin: 2em; background: #fefefe; color: #111; }
+  pre { background: #eee; padding: 1em; overflow-x: auto; }
+  ul { background: #f9f9f9; padding: 1em; border: 1px solid #ddd; }
+</style>
+</head>
+<body>
+  <h1>Class: \${className}</h1>
+  <h2>Variables declared in constructor</h2>
+  <ul>
+    \${
+      vars.length === 0
+        ? '<li><i>No variables declared in constructor.</i></li>'
+        : vars.map(v => '<li>' + escapeHtml(v) + '</li>').join('')
+    }
+  </ul>
+  <h2>Source code of ${jsfile}</h2>
+  <pre>\${rawSrc}</pre>
+</body>
+</html>
+\`;
+
+                require('fs').writeFileSync('js_class_info/$jsfile.html', html);
+              "
+            fi
+          done
+
+      - name: Generate directory listing HTML (index.html)
+        run: |
+          echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Project Directory and Docs</title><style>
+          body { font-family: Arial, sans-serif; margin: 2em; max-width: 900px; }
+          table { border-collapse: collapse; width: 100%; margin-top: 1em; }
+          th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+          th { background-color: #f4f4f4; }
+          tr:hover { background-color: #f1f1f1; }
+          a { color: #0366d6; text-decoration: none; }
+          a:hover { text-decoration: underline; }
+          </style></head><body>' > index.html
+
+          cat readme_fragment.html >> index.html
+          echo '<hr /><h2>Directory Listing</h2><table><thead><tr><th>Name</th><th>Size</th><th>Last Modified</th></tr></thead><tbody>' >> index.html
+
+          for f in $(find . -maxdepth 1 ! -name . ! -name '.git' ! -name 'index.html' ! -name 'readme_fragment.html' ! -name '*.html' ! -name 'js_class_info' | sort); do
+            fname=$(echo $f | sed 's|^\./||')
+
+            if [ -d "$fname" ]; then
+              link="${fname}/"
+              displayname="${fname}/"
+              size="-"
+            else
+              ext="${fname##*.}"
+              if [ "$ext" = "md" ]; then
+                htmlname="${fname%.md}.html"
+                if [ -f "$htmlname" ]; then
+                  link="$htmlname"
+                else
+                  link="$fname"
+                fi
+              elif [ "$ext" = "js" ]; then
+                if [ -f "js_class_info/${fname}.html" ]; then
+                  link="js_class_info/${fname}.html"
+                else
+                  link="$fname"
+                fi
+              else
+                link="$fname"
+              fi
+
+              displayname="$fname"
+              size=$(stat -c%s "$fname" | numfmt --to=iec)
+            fi
+
+            modtime=$(stat -c '%y' "$fname" | cut -d'.' -f1)
+            echo "<tr><td><a href=\"$link\">$displayname</a></td><td>$size</td><td>$modtime</td></tr>" >> index.html
+          done
+
+          echo '</tbody></table></body></html>' >> index.html
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
